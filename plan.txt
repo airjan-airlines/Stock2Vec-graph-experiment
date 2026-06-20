@@ -1,0 +1,14 @@
+Goal: Create time series embeddings for equity movement for vector search. 
+
+Optimizing for: Historical lookback of specific moments, return preditive accuracy
+
+Methods: Use a correlation matrix of S&P 500 and graph neural network to learn dynamic embeddings
+- Want to learn how the stocks are related
+
+Loss Function: Up to you. 
+
+Given: Old data pulling for features (choose what you want), ALPACA (free) and FRED API. Can also use YFinance for more data than alpaca
+Also given old eval scripts (may have data leakage or be innacurate)
+
+Evals: 
+- UMAP colored by volatility, IC testing, UMAP by tickers, other cool stuff
