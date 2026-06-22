@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from data.prep_features import FEATURE_COLS as INTRADAY_FEATURE_COLS
 from data.prep_features_daily import FEATURE_COLS as DAILY_FEATURE_COLS
@@ -25,6 +25,31 @@ WINDOW_INTRADAY = 65
 WINDOW_DAILY = 20
 STEP_INTRADAY = 13
 STEP_DAILY = 1
+
+
+class _AllWindowsDataset(Dataset):
+    """Lazy dataset of all windows across all tickers."""
+
+    def __init__(self, bundle: NPZBundle, window: int, step: int):
+        self.bundle = bundle
+        self.window = window
+        self.samples: list[tuple[int, int, int]] = []  # (ticker_idx, center, start)
+        for i in range(len(bundle.tickers)):
+            L = int(bundle.lengths[i])
+            if L < window:
+                continue
+            starts = range(0, max(L - window + 1, 0), step)
+            for s in starts:
+                center = min(s + window // 2, L - 1)
+                self.samples.append((i, center, s))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        ticker_idx, center, start = self.samples[idx]
+        w = self.bundle.x[ticker_idx, :, start:start + self.window].float()
+        return w, ticker_idx, center
 
 
 def resolve_device(name: str | None = None) -> torch.device:
@@ -47,7 +72,7 @@ def resolve_ckpt_path(ckpt: str | Path | None, daily: bool) -> Path:
 
 
 def load_encoder(ckpt_path: Path, in_channels: int, n_macro: int, device: torch.device):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["encoder_state_dict"]
     cleaned = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     use_macro = any(k.startswith("macro_head") or k.startswith("fusion") for k in cleaned)
@@ -149,6 +174,7 @@ def build_embedding_table(
     use_macro: bool,
     device: torch.device,
     bars_dir: Path | None = None,
+    batch_size: int = 2048,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Encode all tickers and return aligned arrays:
@@ -173,24 +199,52 @@ def build_embedding_table(
             f"data/raw/{bars_kind}/{tag}/."
         )
 
+    # Build one large dataset of all windows across all tickers
+    all_ds = _AllWindowsDataset(bundle, window, step)
+    if len(all_ds) == 0:
+        raise ValueError("No valid windows found in NPZ bundle.")
+
+    loader = DataLoader(all_ds, batch_size=batch_size, shuffle=False)
+
+    all_embs: list[torch.Tensor] = []
+    all_tidxs: list[torch.Tensor] = []
+    all_centers: list[torch.Tensor] = []
+    if str(device) == "cuda":
+        torch.cuda.empty_cache()
+
+    with torch.no_grad():
+        for batch in loader:
+            windows, ticker_idxs, batch_centers = batch
+            windows = windows.to(device)
+            if use_macro and macro_np is not None:
+                m = torch.from_numpy(macro_np[batch_centers.numpy()]).to(device)
+                z = enc(windows, m)
+            else:
+                z = enc(windows)
+            all_embs.append(F.normalize(z, dim=-1).cpu())
+            all_tidxs.append(ticker_idxs)
+            all_centers.append(batch_centers)
+
+    embeddings = torch.cat(all_embs, dim=0).numpy()
+    ticker_idx_arr = torch.cat(all_tidxs).numpy()
+    center_arr = torch.cat(all_centers).numpy()
+
     rows: list[dict] = []
 
     for i, ticker in enumerate(bundle.tickers):
-        L = int(bundle.lengths[i])
-        if L < window:
+        mask = ticker_idx_arr == i
+        if not mask.any():
             continue
-        series = bundle.x[i].numpy()
-        emb, starts = encode_series(enc, series, L, macro_np, window, step, use_macro, device)
-        if not starts:
-            continue
+        order = np.argsort(center_arr[mask])
+        tick_embs = embeddings[mask][order]
+        tick_centers = center_arr[mask][order].tolist()
 
-        centers = [min(s + window // 2, L - 1) for s in starts]
-        rvols = series[rvol_idx, centers].astype(np.float64)
+        rvols = bundle.x[i, rvol_idx, tick_centers].numpy().astype(np.float64)
 
         if bundle.fwd_ret_1d is not None:
-            fwd = bundle.fwd_ret_1d[i][centers]
+            fwd = bundle.fwd_ret_1d[i][tick_centers]
             if bundle.dates is not None:
-                dates = [str(d)[:10] for d in bundle.dates[centers]]
+                dates = [str(d)[:10] for d in bundle.dates[tick_centers]]
             else:
                 raise ValueError(
                     "NPZ provides fwd_ret_1d but no dates array — cannot group cross-sectional IC."
@@ -198,20 +252,21 @@ def build_embedding_table(
         elif bars_dir and (bars_dir / f"{ticker}.parquet").exists():
             import pandas as pd
 
+            L = int(bundle.lengths[i])
             df = pd.read_parquet(bars_dir / f"{ticker}.parquet").sort_values("timestamp").iloc[:L]
             closes = df["close"].to_numpy(dtype=np.float64)
             date_arr = pd.to_datetime(df["timestamp"], utc=True).dt.strftime("%Y-%m-%d").to_numpy()
             fwd = np.array([
                 (closes[min(c + fwd_step, L - 1)] - closes[c]) / (closes[c] + 1e-12)
-                for c in centers
+                for c in tick_centers
             ])
-            dates = [date_arr[c] for c in centers]
+            dates = [date_arr[c] for c in tick_centers]
         else:
             continue
 
-        for j in range(len(starts)):
+        for j in range(len(tick_centers)):
             rows.append({
-                "emb": emb[j],
+                "emb": tick_embs[j],
                 "rvol": rvols[j],
                 "fwd": float(fwd[j]),
                 "date": dates[j],

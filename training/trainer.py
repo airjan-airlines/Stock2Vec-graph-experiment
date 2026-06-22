@@ -52,9 +52,23 @@ class Trainer:
         self.start_epoch = 0
 
     def save_checkpoint(self, epoch: int, is_best: bool = False) -> Path:
+        raw_state = self.model.state_dict()
+        # extract encoder state dict for backward compat with evals/encode.py
+        encoder_sd = raw_state
+        if any(k.startswith("temporal_encoder.") for k in raw_state):
+            encoder_sd = {
+                k.removeprefix("temporal_encoder."): v
+                for k, v in raw_state.items() if k.startswith("temporal_encoder.")
+            }
+        elif any(k.startswith("base_encoder.") for k in raw_state):
+            encoder_sd = {
+                k.removeprefix("base_encoder."): v
+                for k, v in raw_state.items() if k.startswith("base_encoder.")
+            }
         ckpt = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": raw_state,
+            "encoder_state_dict": encoder_sd,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "history": self.history,
             "best_val_loss": self.best_val_loss,

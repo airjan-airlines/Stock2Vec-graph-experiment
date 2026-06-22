@@ -31,6 +31,8 @@ def compute_rolling_correlation(
         else:
             corr = valid.corr().to_numpy(dtype=np.float32)
             corr = np.nan_to_num(corr, nan=0.0)
+            np.fill_diagonal(corr, 1.0)
+            corr = (corr + corr.T) / 2
             corr_matrices[i] = corr
     corr_matrices[:corr_window] = np.eye(n_stocks, dtype=np.float32)
     return corr_matrices
@@ -89,5 +91,7 @@ def build_sparse_adjacency(
     else:
         corr = valid.corr().to_numpy(dtype=np.float32)
         corr = np.nan_to_num(corr, nan=0.0)
+        np.fill_diagonal(corr, 1.0)
+        corr = (corr + corr.T) / 2
         adj = correlation_to_adjacency(corr, threshold=corr_threshold, top_k=top_k)
     return adj, tickers
