@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Literal
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +53,7 @@ class TemporalConvEncoder(nn.Module):
         self.proj = nn.Linear(channels[-1], encoding_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x input layout: (B, F, W)
         out = self.tcn(x)
         return self.proj(out[:, :, -1])
 
@@ -85,28 +85,31 @@ class TemporalTransformerEncoder(nn.Module):
         self.output_proj = nn.Linear(d_model, encoding_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert (B, F, W) -> (B, W, F)
         x = x.transpose(1, 2)
+        seq_len = x.size(1)
         x = self.input_proj(x)
         x = self.pos_enc(x)
-        x = self.transformer(x)
-        return self.output_proj(x[:, -1])
+        mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=x.device), diagonal=1)
+        out = self.transformer(x, mask=mask, is_causal=True)
+        return self.output_proj(out[:, -1])
 
 
 class TemporalCNNEncoder(nn.Module):
     def __init__(self, in_channels: int, encoding_size: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
+        self.conv = nn.Sequential(
             nn.Conv1d(in_channels, 32, kernel_size=5, padding=2),
             nn.ReLU(),
             nn.Conv1d(32, 64, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(64, encoding_size),
-        )
+            nn.AdaptiveAvgPool1d(1))
+        self.proj = nn.Linear(64, encoding_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        out = self.conv(x)  
+        out = out.squeeze(-1)  
+        return self.proj(out)
 
 
 def build_temporal_encoder(encoder_type: Literal["tcn", "transformer", "cnn"],

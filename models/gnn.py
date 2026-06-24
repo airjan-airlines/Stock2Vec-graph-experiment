@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Literal
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,8 +15,12 @@ class GraphConvLayer(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        support = x @ self.weight
-        out = adj @ support + self.bias
+        support = torch.matmul(x, self.weight)
+        out = torch.matmul(adj, support)
+        if len(out.shape) == 3:
+            out = out + self.bias.unsqueeze(0).unsqueeze(0)
+        else:
+            out = out + self.bias
         return self.dropout(F.relu(out))
 
 
@@ -34,19 +37,27 @@ class GraphAttentionLayer(nn.Module):
         nn.init.xavier_uniform_(self.a)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        n = x.size(0)
-        h = x @ self.W
-        h = h.view(n, self.heads, self.out_dim)
-
-        h_i = h.unsqueeze(0).expand(n, -1, -1, -1)
-        h_j = h.unsqueeze(1).expand(-1, n, -1, -1)
-        a_input = torch.cat([h_i, h_j], dim=-1)
-        e = self.leaky_relu(torch.einsum("ijhd,dh->ijh", a_input, self.a))
-        att = torch.where(adj.unsqueeze(-1) > 0, e, torch.full_like(e, -1e9))
-        att = F.softmax(att, dim=1)
+        is_batched = len(x.shape) == 3
+        if is_batched:
+            b, n, _ = x.shape
+        else:
+            b, n = 1, x.shape[0]
+            x = x.unsqueeze(0)
+            adj = adj.unsqueeze(0)
+        h = torch.matmul(x, self.W)
+        h = h.view(b, n, self.heads, self.out_dim)
+        h_i = h.unsqueeze(2).expand(-1, -1, n, -1, -1) 
+        h_j = h.unsqueeze(1).expand(-1, n, -1, -1, -1) 
+        a_input = torch.cat([h_i, h_j], dim=-1)         
+        e = self.leaky_relu(torch.einsum("bijhd,dh->bijh", a_input, self.a))
+        mask = adj.unsqueeze(-1).expand(-1, -1, -1, self.heads)
+        att = torch.where(mask > 0, e, torch.full_like(e, -1e9))
+        att = F.softmax(att, dim=2)  
         att = self.dropout(att)
-        h_out = torch.einsum("ijh,nhd->ihd", att, h)
-        h_out = h_out.mean(dim=1)
+        h_out = torch.einsum("bijh,bjhd->bihd", att, h)
+        h_out = h_out.mean(dim=2)  
+        if not is_batched:
+            h_out = h_out.squeeze(0)    
         return F.elu(h_out)
 
 
@@ -60,8 +71,7 @@ class CorrelationGNN(nn.Module):
         dims = [node_dim] + [hidden_dim] * (num_layers - 1) + [encoding_size]
         for i in range(num_layers):
             if layer_type == "gat":
-                layers.append(GraphAttentionLayer(dims[i], dims[i + 1],
-                                                   heads=gat_heads, dropout=dropout))
+                layers.append(GraphAttentionLayer(dims[i], dims[i + 1],heads=gat_heads, dropout=dropout))
             else:
                 layers.append(GraphConvLayer(dims[i], dims[i + 1], dropout=dropout))
         self.layers = nn.ModuleList(layers)
@@ -79,7 +89,13 @@ class TemporalGNNEncoder(nn.Module):
         self.gnn = gnn
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        node_embs = self.temporal_encoder(x)
+        if len(x.shape) == 4:
+            b, n, f, w = x.shape
+            x_reshaped = x.view(b * n, f, w)
+            node_embs = self.temporal_encoder(x_reshaped)  
+            node_embs = node_embs.view(b, n, -1)
+        else:
+            node_embs = self.temporal_encoder(x) 
         return self.gnn(node_embs, adj)
 
 
@@ -90,9 +106,14 @@ def correlation_to_adj(corr: torch.Tensor, threshold: float = 0.3, top_k: int | 
         adj = adj * (adj > threshold).float()
     if top_k is not None:
         topk_vals, _ = adj.topk(min(top_k, adj.size(-1)), dim=-1)
-        min_vals = topk_vals[:, -1:]
+        min_vals = topk_vals[..., -1:]
         adj = adj * (adj >= min_vals).float()
     if self_loop:
-        adj = adj + torch.eye(adj.size(0), device=adj.device)
-    d_inv = torch.diag(adj.sum(dim=-1).pow(-0.5).clamp(min=1e-8))
+        n_stocks = adj.size(-1)
+        eye = torch.eye(n_stocks, device=adj.device)
+        if len(adj.shape) == 3:
+            eye = eye.unsqueeze(0)
+        adj = adj + eye
+    deg_sum = adj.sum(dim=-1).clamp(min=1e-8)
+    d_inv = torch.diag_embed(deg_sum.pow(-0.5))
     return d_inv @ adj @ d_inv
